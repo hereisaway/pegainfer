@@ -697,7 +697,7 @@ fn tp2_scheduler_runs_forced_mixed_steps() {
     else {
         return;
     };
-    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0)
+    let mut engine = start_tp_with_capacity(&model_path, 42, &[0, 1], 2, 1, false, 0, 0)
         .expect("start TP2 scheduler");
     let LiveScheduler { mut handle, join } = engine.schedulers.remove(0);
     let mut steps = handle.take_steps().unwrap();

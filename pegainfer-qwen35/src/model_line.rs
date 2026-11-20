@@ -28,8 +28,7 @@ struct Qwen35Cli {
     #[arg(long, default_value_t = 0)]
     qwen35_prefix_cache_mib: usize,
     /// Per-rank pinned-host budget in MiB for spilled snapshot state; zero keeps
-    /// the host tier off. Requires a positive --qwen35-prefix-cache-mib and is
-    /// single-GPU only for now.
+    /// the host tier off. Requires a positive --qwen35-prefix-cache-mib.
     #[arg(long, default_value_t = 0)]
     qwen35_snapshot_host_mib: usize,
     /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
@@ -151,11 +150,6 @@ impl ModelLine for Qwen35Line {
                 "--qwen35-snapshot-host-mib requires --qwen35-prefix-cache-mib > 0",
             ));
         }
-        if cli.qwen35_snapshot_host_mib > 0 && ctx.shared.tp_size > 1 {
-            return Err(CliError::rule(
-                "Qwen3.5 --qwen35-snapshot-host-mib is single-GPU only for now",
-            ));
-        }
         crate::check_launch(
             cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
             ctx.shared.tp_size > 1,
@@ -234,8 +228,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_snapshot_host_on_tp() {
-        let error = validate_argv(&[
+    fn accepts_snapshot_host_on_tp() {
+        validate_argv(&[
             "pegainfer",
             "--qwen35-prefix-cache-mib",
             "128",
@@ -245,9 +239,7 @@ mod tests {
             "2",
             "--cuda-graph=false",
         ])
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("single-GPU only"), "{error}");
+        .expect("Qwen3.5 should accept the host tier on TP");
     }
 
     #[test]

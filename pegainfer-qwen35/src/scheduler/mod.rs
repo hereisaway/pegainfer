@@ -290,6 +290,7 @@ pub(crate) fn start_tp_with_capacity(
     max_prefill_tokens: usize,
     enable_cuda_graph: bool,
     prefix_snapshot_bytes: usize,
+    host_snapshot_bytes: usize,
 ) -> Result<Engine> {
     assert!(
         max_prefill_tokens > 0,
@@ -302,6 +303,7 @@ pub(crate) fn start_tp_with_capacity(
         max_prefill_tokens,
         enable_cuda_graph,
         prefix_snapshot_bytes,
+        host_snapshot_bytes,
     )?;
     let servable = servable_len(
         backend.max_position_embeddings(),

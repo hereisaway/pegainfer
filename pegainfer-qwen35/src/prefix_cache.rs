@@ -127,6 +127,8 @@ struct SnapshotCache {
     free_host_slots: Vec<usize>,
     /// Number of preallocated GPU snapshot slots (the legacy capacity metric).
     gpu_slot_count: usize,
+    /// Number of preallocated host snapshot slots.
+    host_slot_count: usize,
     /// Monotonic logical time for LRU ordering.
     clock: u64,
     spills: u64,
@@ -141,6 +143,7 @@ impl SnapshotCache {
             free_gpu_slots: (0..gpu_slot_count).rev().collect(),
             free_host_slots: (0..host_slot_count).rev().collect(),
             gpu_slot_count,
+            host_slot_count,
             clock: 0,
             spills: 0,
             host_evictions: 0,
@@ -273,8 +276,53 @@ impl SnapshotReservation {
     }
 }
 
+/// A pending GPU -> host copy produced by [`RecurrentSnapshotStore::plan_reserve`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnapshotSpill {
+    pub(crate) victim_key: PrefixBoundaryKey,
+    pub(crate) gpu_slot: usize,
+    pub(crate) host_slot: usize,
+}
+
+/// A reservation decision. The caller performs [`Self::spill`] (when present)
+/// before [`RecurrentSnapshotStore::commit_reserve`], so TP can broadcast the
+/// same spill to every rank and the single-GPU path can copy locally.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SnapshotReservePlan {
+    reservation: SnapshotReservation,
+    spill: Option<SnapshotSpill>,
+}
+
+impl SnapshotReservePlan {
+    pub(crate) fn reservation(self) -> SnapshotReservation {
+        self.reservation
+    }
+
+    pub(crate) fn spill(self) -> Option<SnapshotSpill> {
+        self.spill
+    }
+}
+
+/// Number of pinned-host snapshot slots for `host_snapshot_bytes`.
+pub(crate) fn host_snapshot_slots(
+    host_snapshot_bytes: usize,
+    snapshot_bytes_per_slot: usize,
+) -> Result<usize> {
+    if host_snapshot_bytes == 0 {
+        return Ok(0);
+    }
+    let slots = host_snapshot_bytes / snapshot_bytes_per_slot;
+    anyhow::ensure!(
+        slots > 0,
+        "Qwen3.5 snapshot-host budget is {} MiB, but one snapshot requires {:.3} MiB",
+        host_snapshot_bytes / (1024 * 1024),
+        snapshot_bytes_per_slot as f64 / 1024.0 / 1024.0,
+    );
+    Ok(slots)
+}
+
 /// Pinned-host backing for recurrent/conv snapshots.
-struct HostSnapshotSlab {
+pub(crate) struct HostSnapshotSlab {
     state: PinnedHostSlice<f32>,
     conv: PinnedHostSlice<half::bf16>,
     slots: usize,
@@ -286,7 +334,7 @@ struct HostSnapshotSlab {
 }
 
 impl HostSnapshotSlab {
-    fn new(
+    pub(crate) fn new(
         ctx: &DeviceContext,
         config: &Config35,
         geometry: LocalGeometry,
@@ -316,7 +364,12 @@ impl HostSnapshotSlab {
         })
     }
 
-    fn spill_from(&mut self, ctx: &DeviceContext, src: &RecurrentState, slot: usize) -> Result<()> {
+    pub(crate) fn spill_from(
+        &mut self,
+        ctx: &DeviceContext,
+        src: &RecurrentState,
+        slot: usize,
+    ) -> Result<()> {
         anyhow::ensure!(slot < self.slots, "host snapshot slot {slot} out of range");
         anyhow::ensure!(
             src.layers.len() == self.layers,
@@ -344,7 +397,7 @@ impl HostSnapshotSlab {
         Ok(())
     }
 
-    fn restore_into(
+    pub(crate) fn restore_into(
         &self,
         ctx: &DeviceContext,
         slot: usize,
@@ -399,6 +452,12 @@ impl RecurrentStateStore {
         Ok(Self { slots })
     }
 
+    pub(crate) fn state(&self, slot: usize) -> Result<&RecurrentState> {
+        self.slots
+            .get(slot)
+            .ok_or_else(|| anyhow::anyhow!("snapshot slot {slot} out of range"))
+    }
+
     pub(crate) fn save(
         &mut self,
         ctx: &DeviceContext,
@@ -439,8 +498,13 @@ pub(crate) struct RecurrentSnapshotStore {
 impl RecurrentSnapshotStore {
     /// Directory only: no physical slots (TP controller, zero-budget builds).
     pub(crate) fn new_directory(gpu_slot_count: usize) -> Self {
+        Self::new_directory_with_host(gpu_slot_count, 0)
+    }
+
+    /// Directory with host slots but no local physical slots (TP controller).
+    pub(crate) fn new_directory_with_host(gpu_slot_count: usize, host_slot_count: usize) -> Self {
         Self {
-            cache: SnapshotCache::new(gpu_slot_count, 0),
+            cache: SnapshotCache::new(gpu_slot_count, host_slot_count),
             slots: None,
             host: None,
             ctx: None,
@@ -501,72 +565,117 @@ impl RecurrentSnapshotStore {
         self.cache.lookup(key)
     }
 
-    /// Reserve a free or reused GPU slot. With a host slab, the GPU victim is
-    /// spilled to pinned host before its slot is reused.
-    pub(crate) fn reserve(
-        &mut self,
-        key: PrefixBoundaryKey,
-    ) -> Result<Option<SnapshotReservation>> {
+    /// Decide which GPU slot the next snapshot uses, without copying anything.
+    ///
+    /// With a host slab, a reused slot returns a [`SnapshotSpill`] the caller
+    /// must perform before [`Self::commit_reserve`]. The single-GPU path copies
+    /// locally; TP broadcasts the same spill to every worker.
+    pub(crate) fn plan_reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservePlan> {
         if self.cache.contains(key) {
             self.cache.touch(key);
-            return Ok(None);
+            return None;
         }
         if let Some(slot) = self.cache.take_free_gpu_slot() {
-            return Ok(Some(SnapshotReservation {
-                k: key,
-                slot,
-                replaced: None,
-            }));
+            return Some(SnapshotReservePlan {
+                reservation: SnapshotReservation {
+                    k: key,
+                    slot,
+                    replaced: None,
+                },
+                spill: None,
+            });
         }
         let Some((victim_key, victim_slot)) = self.cache.take_unpinned_victim(SnapshotTier::Gpu)
         else {
             self.cache.record_skip();
-            return Ok(None);
+            return None;
         };
 
-        let Some(host) = self.host.as_mut() else {
-            return Ok(Some(SnapshotReservation {
+        if self.cache.host_slot_count > 0 {
+            let host_slot = if let Some(slot) = self.cache.take_free_host_slot() {
+                slot
+            } else if let Some((_, slot)) = self.cache.take_unpinned_victim(SnapshotTier::Host) {
+                self.cache.record_host_eviction();
+                slot
+            } else {
+                self.cache.record_skip();
+                self.cache
+                    .insert(victim_key, victim_slot, SnapshotTier::Gpu);
+                return None;
+            };
+            return Some(SnapshotReservePlan {
+                reservation: SnapshotReservation {
+                    k: key,
+                    slot: victim_slot,
+                    replaced: None,
+                },
+                spill: Some(SnapshotSpill {
+                    victim_key,
+                    gpu_slot: victim_slot,
+                    host_slot,
+                }),
+            });
+        }
+
+        Some(SnapshotReservePlan {
+            reservation: SnapshotReservation {
                 k: key,
                 slot: victim_slot,
                 replaced: Some(SnapshotTier::Gpu),
-            }));
-        };
-        let host_slot = if let Some(slot) = self.cache.take_free_host_slot() {
-            slot
-        } else if let Some((_, slot)) = self.cache.take_unpinned_victim(SnapshotTier::Host) {
-            self.cache.record_host_eviction();
-            slot
-        } else {
-            self.cache.record_skip();
+            },
+            spill: None,
+        })
+    }
+
+    /// Commit a plan after every required spill has completed.
+    pub(crate) fn commit_reserve(&mut self, plan: SnapshotReservePlan) {
+        if let Some(spill) = plan.spill {
+            self.cache.record_spill();
             self.cache
-                .insert(victim_key, victim_slot, SnapshotTier::Gpu);
+                .insert(spill.victim_key, spill.host_slot, SnapshotTier::Host);
+        }
+    }
+
+    /// Abort a plan: restore the spilled victim to GPU or release the free slot.
+    pub(crate) fn abort_reserve(&mut self, plan: SnapshotReservePlan) {
+        if let Some(spill) = plan.spill {
+            self.cache.release_host_slot(spill.host_slot);
+            self.cache
+                .insert(spill.victim_key, spill.gpu_slot, SnapshotTier::Gpu);
+        } else {
+            self.cache.release_gpu_slot(plan.reservation.slot);
+        }
+    }
+
+    /// Reserve and spill locally (single-GPU path).
+    pub(crate) fn reserve(
+        &mut self,
+        key: PrefixBoundaryKey,
+    ) -> Result<Option<SnapshotReservation>> {
+        let Some(plan) = self.plan_reserve(key) else {
             return Ok(None);
         };
-        let ctx = self
-            .ctx
-            .as_ref()
-            .expect("host snapshot store requires a device context");
-        let slots = self
-            .slots
-            .as_ref()
-            .expect("host snapshot store requires GPU slots");
-        let src = slots
-            .slots
-            .get(victim_slot)
-            .ok_or_else(|| anyhow::anyhow!("snapshot slot {victim_slot} out of range"))?;
-        if let Err(error) = host.spill_from(ctx, src, host_slot) {
-            self.cache.release_host_slot(host_slot);
-            self.cache
-                .insert(victim_key, victim_slot, SnapshotTier::Gpu);
-            return Err(error);
+        if let Some(spill) = plan.spill {
+            let ctx = self
+                .ctx
+                .as_ref()
+                .expect("host snapshot store requires a device context");
+            let slots = self
+                .slots
+                .as_ref()
+                .expect("host snapshot store requires GPU slots");
+            let src = slots.state(spill.gpu_slot)?;
+            let host = self
+                .host
+                .as_mut()
+                .expect("host snapshot store requires a host slab");
+            if let Err(error) = host.spill_from(ctx, src, spill.host_slot) {
+                self.abort_reserve(plan);
+                return Err(error);
+            }
         }
-        self.cache.record_spill();
-        self.cache.insert(victim_key, host_slot, SnapshotTier::Host);
-        Ok(Some(SnapshotReservation {
-            k: key,
-            slot: victim_slot,
-            replaced: None,
-        }))
+        self.commit_reserve(plan);
+        Ok(Some(plan.reservation()))
     }
 
     pub(crate) fn publish(&mut self, reservation: SnapshotReservation) {
@@ -866,11 +975,11 @@ impl Qwen35PrefixCache {
     /// slot on every rank, then publishes or aborts the reservation. Duplicate
     /// boundaries, disabled caching, ineligible boundaries, and fully pinned
     /// capacity return `None`.
-    pub(crate) fn reserve_snapshot(
-        &mut self,
+    fn snapshot_key(
+        &self,
         request: &RequestKv,
         boundary: usize,
-    ) -> Result<Option<SnapshotReservation>> {
+    ) -> Result<Option<PrefixBoundaryKey>> {
         if !self.enabled() {
             return Ok(None);
         }
@@ -880,11 +989,43 @@ impl Qwen35PrefixCache {
         let sequence_hash = request
             .registered_boundary_hash(boundary)
             .ok_or_else(|| anyhow::anyhow!("no registered KV hash at boundary {boundary}"))?;
-        let key = PrefixBoundaryKey {
+        Ok(Some(PrefixBoundaryKey {
             sequence_hash,
             boundary_tokens: boundary,
+        }))
+    }
+
+    pub(crate) fn reserve_snapshot(
+        &mut self,
+        request: &RequestKv,
+        boundary: usize,
+    ) -> Result<Option<SnapshotReservation>> {
+        let Some(key) = self.snapshot_key(request, boundary)? else {
+            return Ok(None);
         };
         self.snapshots.reserve(key)
+    }
+
+    /// Plan a reservation without copying. TP broadcasts `plan.spill()` to every
+    /// worker, then calls `commit_reserve_snapshot`; the single-GPU path uses
+    /// `reserve_snapshot` above.
+    pub(crate) fn plan_reserve_snapshot(
+        &mut self,
+        request: &RequestKv,
+        boundary: usize,
+    ) -> Result<Option<SnapshotReservePlan>> {
+        let Some(key) = self.snapshot_key(request, boundary)? else {
+            return Ok(None);
+        };
+        Ok(self.snapshots.plan_reserve(key))
+    }
+
+    pub(crate) fn commit_reserve_snapshot(&mut self, plan: SnapshotReservePlan) {
+        self.snapshots.commit_reserve(plan);
+    }
+
+    pub(crate) fn abort_reserve_snapshot(&mut self, plan: SnapshotReservePlan) {
+        self.snapshots.abort_reserve(plan);
     }
 
     /// Publish after rank-local snapshot copies succeed. `reserve_snapshot`
@@ -1161,6 +1302,41 @@ mod tests {
             .expect("read restored conv state");
         assert_eq!(restored_state, host_state);
         assert_eq!(restored_conv, host_conv);
+    }
+
+    #[test]
+    fn host_plan_commit_moves_victim_to_host() {
+        let mut state = RecurrentSnapshotStore::new_directory_with_host(1, 1);
+        let first = state.reserve(key(1)).expect("reserve").expect("slot");
+        state.publish(first);
+        let plan = state.plan_reserve(key(2)).expect("spill plan");
+        let spill = plan.spill().expect("host spill");
+        assert_eq!(spill.gpu_slot, 0);
+        assert_eq!(spill.host_slot, 0);
+        state.commit_reserve(plan);
+        state.publish(plan.reservation());
+        assert_eq!(
+            state.lookup(key(1)).expect("victim").tier(),
+            SnapshotTier::Host
+        );
+        assert_eq!(
+            state.lookup(key(2)).expect("new entry").tier(),
+            SnapshotTier::Gpu
+        );
+    }
+
+    #[test]
+    fn host_plan_abort_restores_victim() {
+        let mut state = RecurrentSnapshotStore::new_directory_with_host(1, 1);
+        let first = state.reserve(key(1)).expect("reserve").expect("slot");
+        state.publish(first);
+        let plan = state.plan_reserve(key(2)).expect("spill plan");
+        state.abort_reserve(plan);
+        assert_eq!(
+            state.lookup(key(1)).expect("victim").tier(),
+            SnapshotTier::Gpu
+        );
+        assert!(state.lookup(key(2)).is_none());
     }
 
     fn fill_first_layer(

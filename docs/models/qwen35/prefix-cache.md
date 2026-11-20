@@ -1,6 +1,6 @@
 # Qwen3.5-4B prefix cache
 
-> **TL;DR:** Qwen3.5-4B uses a content-hashed joint prefix cache backed by GPU snapshots: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. An opt-in pinned-host tier (`--qwen35-snapshot-host-mib`, single-GPU for now) can spill the snapshot state and restore a host hit directly; serving keeps it off by default. Snapshots are taken only at budget-sized prefill step ends rounded down to 256 tokens plus one stop at the last boundary of `history_tokens` (or the prompt), so the cache no longer splits cold prefill every 256 tokens. KV stays in kvbm's reclaimable inactive pool, while `RecurrentSnapshotStore` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests passed for #836; the tests #1077 changed have run on TP1 (Qwen3.5-2B and 4B) only so far. A 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
+> **TL;DR:** Qwen3.5-4B uses a content-hashed joint prefix cache backed by GPU snapshots: full-attention KV is reusable only with a matching complete recurrent/conv snapshot at the same 256-token boundary, otherwise the request is cold. An opt-in per-rank pinned-host tier (`--qwen35-snapshot-host-mib`) can spill the snapshot state and restore a host hit directly; serving keeps it off by default. Snapshots are taken only at budget-sized prefill step ends rounded down to 256 tokens plus one stop at the last boundary of `history_tokens` (or the prompt), so the cache no longer splits cold prefill every 256 tokens. KV stays in kvbm's reclaimable inactive pool, while `RecurrentSnapshotStore` owns snapshot lookup, pinning, LRU, and publication. TP1/TP2 correctness and serving tests passed for #836; the tests #1077 changed have run on TP1 (Qwen3.5-2B and 4B) only so far. A 4,160-token shared prefix cuts warm TTFT by 94.3% (TP1) / 95.1% (TP2).
 >
 > **Last touched:** 2026-11
 
@@ -144,9 +144,9 @@ slots on the single-GPU backend:
 - **TP:** the controller uses `RecurrentSnapshotStore::new_directory` (metadata
   only), while each worker keeps its own `RecurrentStateStore`. The controller's
   slot decision is broadcast, so every rank uses the same slot number.
-- **Host tier:** the store can also own a pinned host slab. Serving keeps
-  `host_slots = 0` until the step-3 flag lands; the spill path is exercised by
-  the device tests.
+- **Host tier:** `--qwen35-snapshot-host-mib` sets a per-rank pinned-host
+  budget. The single-GPU backend owns the slab directly; under TP the controller
+  owns the directory decision and each worker owns its local host slab.
 
 ```rust
 struct Qwen35PrefixCache {
@@ -214,8 +214,10 @@ snapshot-sized slot per host entry (49.125 MiB for Qwen3.5-4B).
   cannot reach it, and the host LRU eventually drops it.
 - Restore is synchronous in v1 (about 1.1-2.2 ms H2D for one slot).
 - `--qwen35-snapshot-host-mib` sets a per-rank pinned-host budget. A positive
-  value requires `--qwen35-prefix-cache-mib > 0`, must hold at least one
-  snapshot slot, and is single-GPU only for now; TP slot agreement lands later.
+  value requires `--qwen35-prefix-cache-mib > 0` and must hold at least one
+  snapshot slot. Under TP every rank allocates the same slot count; the
+  controller broadcasts the tier/slot decision and workers perform their own
+  D2H/H2D, reporting a hit only after all ranks confirm.
 - Qwen3.5 publishes the shared prefix-cache query/hit counters (host-restored
   tokens land in `host_hits`); spill, host-eviction and skip counters stay in
   the prefix-cache summary log until their metric names are agreed.

@@ -116,23 +116,6 @@ impl From<TpBeginRequestError> for AdmissionError {
     }
 }
 
-fn host_snapshot_slots(
-    host_snapshot_bytes: usize,
-    snapshot_bytes_per_slot: usize,
-) -> Result<usize> {
-    if host_snapshot_bytes == 0 {
-        return Ok(0);
-    }
-    let slots = host_snapshot_bytes / snapshot_bytes_per_slot;
-    anyhow::ensure!(
-        slots > 0,
-        "Qwen3.5 snapshot-host budget is {} MiB, but one snapshot requires {:.3} MiB",
-        host_snapshot_bytes / (1024 * 1024),
-        snapshot_bytes_per_slot as f64 / 1024.0 / 1024.0,
-    );
-    Ok(slots)
-}
-
 impl SingleGpuBackend {
     fn schedule_prefill_views(
         &self,
@@ -270,7 +253,8 @@ impl SingleGpuBackend {
             KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
         let snapshot_bytes_per_slot =
             crate::recurrent_state::bytes_per_request(model.config(), model.geometry);
-        let host_slots = host_snapshot_slots(host_snapshot_bytes, snapshot_bytes_per_slot)?;
+        let host_slots =
+            crate::prefix_cache::host_snapshot_slots(host_snapshot_bytes, snapshot_bytes_per_slot)?;
         anyhow::ensure!(
             host_snapshot_bytes == 0 || model.prefix_snapshot_slots() > 0,
             "Qwen3.5 snapshot-host tier requires a positive GPU prefix-cache budget"
@@ -687,6 +671,7 @@ impl TpSchedulerBackend {
         max_prefill_tokens: usize,
         enable_cuda_graph: bool,
         prefix_snapshot_bytes: usize,
+        host_snapshot_bytes: usize,
     ) -> Result<Self> {
         let executor = Qwen35TpExecutor::from_runtime_with_limits_and_prefix(
             model_path,
@@ -695,6 +680,7 @@ impl TpSchedulerBackend {
             max_batch,
             max_prefill_tokens,
             prefix_snapshot_bytes,
+            host_snapshot_bytes,
         )?;
         Ok(Self {
             executor,
@@ -926,7 +912,7 @@ impl SchedulerBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::host_snapshot_slots;
+    use crate::prefix_cache::host_snapshot_slots;
 
     #[test]
     fn host_snapshot_slots_rounds_down_and_rejects_empty() {

@@ -324,10 +324,6 @@ fn start_engine_with_backend(
         .ok_or_else(|| anyhow!("Qwen3.5 snapshot-host MiB budget overflows usize"))?;
     if device_ordinals.len() > 1 {
         anyhow::ensure!(
-            snapshot_host_bytes == 0,
-            "Qwen3.5 snapshot host tier is single-GPU only"
-        );
-        anyhow::ensure!(
             gdn_backend == Qwen35GdnBackend::Triton,
             "Qwen3.5 flashinfer-candidate requires TP world_size=1"
         );
@@ -342,6 +338,7 @@ fn start_engine_with_backend(
             max_prefill_tokens,
             enable_cuda_graph,
             prefix_snapshot_bytes,
+            snapshot_host_bytes,
         );
     }
 
@@ -444,6 +441,34 @@ mod tests {
             Qwen35DecodeOverlap::Off,
         )
         .expect("Qwen3.5 should start with a pinned-host snapshot budget");
+        drop(engine);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices, NCCL, and Qwen3.5 weights"]
+    fn starts_snapshot_host_budget_on_tp() {
+        let Some(model_path) =
+            crate::test_fixture::model_path_or_skip("starts_snapshot_host_budget_on_tp")
+        else {
+            return;
+        };
+        let options = Qwen35LaunchOptions {
+            device_ordinal: 0,
+            tp_size: 2,
+            cuda_graph: false,
+            max_batch: 1,
+            max_prefill_tokens: 1024,
+            gdn_backend: super::Qwen35GdnBackend::Triton,
+            prefix_cache_mib: 128,
+            snapshot_host_mib: 1024,
+        };
+        let engine = launch_with_options_policy_and_overlap(
+            Path::new(&model_path),
+            options,
+            Qwen35SchedulerPolicy::Off,
+            Qwen35DecodeOverlap::Off,
+        )
+        .expect("Qwen3.5 TP should start with a pinned-host snapshot budget");
         drop(engine);
     }
 
