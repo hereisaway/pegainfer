@@ -1073,3 +1073,91 @@ fn host_snapshot_step4_measurements() {
         drop(handle);
     }
 }
+
+fn host_snapshot_first_token_history(
+    handle: &mut EngineHarness,
+    tokens: Vec<u32>,
+    history_tokens: Option<usize>,
+) -> (std::time::Duration, u32) {
+    let start = Instant::now();
+    let mut request = common::request(
+        tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        1,
+    );
+    request.history_tokens = history_tokens;
+    let control = handle.submit(request);
+    loop {
+        let update = handle.next(control.id());
+        if !update.tokens.is_empty() {
+            return (start.elapsed(), update.tokens[0]);
+        }
+        assert!(
+            update.terminal.is_none(),
+            "request ended before its first token"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires a CUDA device and Qwen3.5 weights"]
+fn host_snapshot_history_and_unaligned_boundaries() {
+    let Some(model_path) =
+        crate::test_fixture::model_path_or_skip("host_snapshot_history_and_unaligned_boundaries")
+    else {
+        return;
+    };
+    let options =
+        crate::Qwen35LaunchOptions::new(0, 1, true, 1, 1024, 64).with_snapshot_host_mib(1024);
+    let engine = crate::launch_with_options_policy_and_overlap(
+        Path::new(&model_path),
+        options,
+        crate::Qwen35SchedulerPolicy::Off,
+        crate::Qwen35DecodeOverlap::Off,
+    )
+    .expect("launch Qwen3.5 with a one-slot snapshot cache");
+    let mut handle = EngineHarness::new(engine);
+
+    let tokens_for = |idx: usize| -> Vec<u32> {
+        (0..4160)
+            .map(|i| 1000 + ((idx * 131 + i * 7) % 200_000) as u32)
+            .collect()
+    };
+
+    // A history stop at 3840 is not a step end; the snapshot must be taken at
+    // that stop and a resume must use the same cut.
+    let history_prompt = tokens_for(0);
+    let (_, cold_history) =
+        host_snapshot_first_token_history(&mut handle, history_prompt.clone(), Some(3840));
+    let _ = host_snapshot_first_token(&mut handle, tokens_for(1));
+    let (_, host_history) =
+        host_snapshot_first_token_history(&mut handle, history_prompt, Some(3840));
+    assert_eq!(
+        host_history, cold_history,
+        "history-stop host hit changed the sampled token"
+    );
+
+    // A 4,160-token prompt ends on the 4,096 boundary, so the remaining 64
+    // tokens are the uncached suffix on a resume.
+    let unaligned_prompt = tokens_for(2);
+    let (_, cold_unaligned) = host_snapshot_first_token(&mut handle, unaligned_prompt.clone());
+    let _ = host_snapshot_first_token(&mut handle, tokens_for(3));
+    let (_, host_unaligned) = host_snapshot_first_token(&mut handle, unaligned_prompt);
+    assert_eq!(
+        host_unaligned, cold_unaligned,
+        "unaligned host hit changed the sampled token"
+    );
+
+    let counters = handle
+        .metrics()
+        .prefix_cache
+        .expect("prefix-cache counters");
+    assert!(
+        counters.host_hits >= 3840 + 4096,
+        "expected both host hits: {counters:?}"
+    );
+    drop(handle);
+}
