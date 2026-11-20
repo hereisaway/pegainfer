@@ -1,10 +1,11 @@
 # Qwen3.5 snapshot host tier on RTX 5090
 
-> **TL;DR:** In-process scheduler first-token latency for Qwen3.5-4B on one
-> RTX 5090, with a 128 MiB GPU snapshot budget (two slots) and a 1024 MiB
-> pinned-host budget (twenty slots). Ten distinct cold prompts and ten host
-> hits per prefix length, sequential, `max_batch=1`, `max_prefill_tokens=N`.
-> Host hits are about 9 ms and flat; cold prefill scales with N.
+> **TL;DR:** Host-tier measurements for Qwen3.5-4B on one RTX 5090. Both the
+> in-process scheduler first-token latency and streaming HTTP TTFT show a flat
+> ~9-12 ms host hit while cold prefill scales with N. The in-process table uses
+> a 1024 MiB host budget and 10 cold/10 host samples; the HTTP table uses
+> 8192 MiB and 31 cold/30 host samples. Exact budgets and methods are in each
+> section.
 
 **Last touched:** 2026-11
 
@@ -19,7 +20,7 @@
   1024 MiB (twenty slots), `max_batch=1`, `max_prefill_tokens=N`,
   CUDA Graph on.
 
-## Measurement
+## In-process scheduler first-token latency
 
 Each length uses eleven distinct prompts of `N + 1` tokens with
 `max_prefill_tokens=N`: the first prefill ends at `N` and publishes a snapshot,
@@ -88,7 +89,9 @@ resume from host with the cold-sampled token.
 
 ## Not covered yet
 
-- More samples and clock control for meaningful p99.
+- More in-process samples and clock control for a meaningful p99 (HTTP already
+  has 31 cold / 30 host samples).
 - KV-eviction miss and the `prompt % block_size == 0 && max_tokens == 1`
   admission boundary in the host path.
-- TP1/TP2 performance rows and budget tables.
+- TP1/TP2 performance rows and budget tables (the 5090 pair has no NVLink/P2P,
+  so TP numbers are not representative).
