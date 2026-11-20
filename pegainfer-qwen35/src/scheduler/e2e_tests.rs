@@ -962,3 +962,114 @@ fn test_e2e_qwen35_scheduler_tp2_graph() {
     let max_context_tokens = max_position_embeddings(&model_path);
     run_full_scheduler_e2e(&mut handle, &tokenizer, max_context_tokens, "TP2 graph");
 }
+
+fn host_snapshot_first_token(
+    handle: &mut EngineHarness,
+    tokens: Vec<u32>,
+) -> (std::time::Duration, u32) {
+    let start = Instant::now();
+    let control = handle.submit(common::request(
+        tokens,
+        SamplingParams {
+            ignore_eos: true,
+            ..SamplingParams::default()
+        },
+        1,
+    ));
+    loop {
+        let update = handle.next(control.id());
+        if !update.tokens.is_empty() {
+            return (start.elapsed(), update.tokens[0]);
+        }
+        assert!(
+            update.terminal.is_none(),
+            "request ended before its first token"
+        );
+    }
+}
+
+fn host_snapshot_percentile(samples: &[std::time::Duration], pct: usize) -> std::time::Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort();
+    sorted[(sorted.len() * pct / 100).min(sorted.len().saturating_sub(1))]
+}
+
+fn host_snapshot_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+#[test]
+#[ignore = "requires a CUDA device and Qwen3.5 weights"]
+fn host_snapshot_step4_measurements() {
+    let Some(model_path) =
+        crate::test_fixture::model_path_or_skip("host_snapshot_step4_measurements")
+    else {
+        return;
+    };
+
+    for &n in &[1024usize, 2048, 4096] {
+        let options =
+            crate::Qwen35LaunchOptions::new(0, 1, true, 1, n, 128).with_snapshot_host_mib(1024);
+        let engine = crate::launch_with_options_policy_and_overlap(
+            Path::new(&model_path),
+            options,
+            crate::Qwen35SchedulerPolicy::Off,
+            crate::Qwen35DecodeOverlap::Off,
+        )
+        .unwrap_or_else(|error| panic!("launch N={n}: {error}"));
+        let mut handle = EngineHarness::new(engine);
+
+        let prompt_len = n + 1;
+        let tokens_for = |idx: usize| -> Vec<u32> {
+            (0..prompt_len)
+                .map(|i| 1000 + ((idx * 131 + i * 7 + n) % 200_000) as u32)
+                .collect()
+        };
+
+        let mut cold = Vec::new();
+        let mut cold_token = 0;
+        for idx in 0..11 {
+            let (elapsed, token) = host_snapshot_first_token(&mut handle, tokens_for(idx));
+            if idx == 0 {
+                cold_token = token;
+            } else {
+                cold.push(elapsed);
+            }
+        }
+
+        // Eleven distinct prompts leave only the newest two on GPU (the
+        // 128 MiB budget is two slots), so prompt 0 is host-resident now.
+        let mut host = Vec::new();
+        for _ in 0..10 {
+            let (elapsed, token) = host_snapshot_first_token(&mut handle, tokens_for(0));
+            assert_eq!(
+                token, cold_token,
+                "host hit changed the sampled token at N={n}"
+            );
+            host.push(elapsed);
+        }
+
+        let metrics = handle.metrics();
+        let counters = metrics.prefix_cache.expect("prefix-cache counters");
+        assert!(
+            counters.host_hits > 0,
+            "expected host hits at N={n}: {counters:?}"
+        );
+        assert!(
+            counters.queries > 0,
+            "expected lookups at N={n}: {counters:?}"
+        );
+
+        println!(
+            "N={n}: cold median={:.3}ms p99={:.3}ms | host median={:.3}ms p99={:.3}ms | queries={} hits={} host_hits={}",
+            host_snapshot_ms(host_snapshot_percentile(&cold, 50)),
+            host_snapshot_ms(host_snapshot_percentile(&cold, 99)),
+            host_snapshot_ms(host_snapshot_percentile(&host, 50)),
+            host_snapshot_ms(host_snapshot_percentile(&host, 99)),
+            counters.queries,
+            counters.hits,
+            counters.host_hits,
+        );
+        drop(handle);
+    }
+}

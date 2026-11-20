@@ -387,12 +387,14 @@ mod tests {
 
     use pegainfer_frontend::engine::EngineLoadOptions;
     use pegainfer_frontend::engine::EpBackend;
+    use pegainfer_frontend::sampler::SamplingParams;
 
     use super::Qwen35DecodeOverlap;
     use super::Qwen35LaunchOptions;
     use super::Qwen35SchedulerPolicy;
     use super::launch_with_options_policy_and_overlap;
     use super::start_engine_with_capacity_policy_and_overlap;
+    use crate::test_fixture::EngineHarness;
 
     #[test]
     fn launch_options_reject_zero_tp_size() {
@@ -469,7 +471,77 @@ mod tests {
             Qwen35DecodeOverlap::Off,
         )
         .expect("Qwen3.5 TP should start with a pinned-host snapshot budget");
-        drop(engine);
+        let mut handle = EngineHarness::new(engine);
+        let control = handle.submit(crate::test_fixture::request(
+            vec![1000; 4],
+            SamplingParams {
+                ignore_eos: true,
+                ..SamplingParams::default()
+            },
+            1,
+        ));
+        let _ = handle.next(control.id());
+        drop(handle);
+    }
+
+    #[test]
+    #[ignore = "requires two CUDA devices, NCCL >= 2.30.4, and Qwen3.5 weights"]
+    fn tp_host_snapshot_spill_and_hit() {
+        let Some(model_path) =
+            crate::test_fixture::model_path_or_skip("tp_host_snapshot_spill_and_hit")
+        else {
+            return;
+        };
+        let options =
+            Qwen35LaunchOptions::new(0, 2, false, 1, 1024, 32).with_snapshot_host_mib(1024);
+        let engine = launch_with_options_policy_and_overlap(
+            Path::new(&model_path),
+            options,
+            Qwen35SchedulerPolicy::Off,
+            Qwen35DecodeOverlap::Off,
+        )
+        .expect("Qwen3.5 TP should start with the host snapshot tier");
+        let mut handle = EngineHarness::new(engine);
+        let tokens_for = |idx: usize| -> Vec<u32> {
+            (0..1025)
+                .map(|i| 1000 + ((idx * 131 + i * 7) % 200_000) as u32)
+                .collect()
+        };
+        let run = |handle: &mut EngineHarness, tokens: Vec<u32>| -> u32 {
+            let control = handle.submit(crate::test_fixture::request(
+                tokens,
+                SamplingParams {
+                    ignore_eos: true,
+                    ..SamplingParams::default()
+                },
+                1,
+            ));
+            loop {
+                let update = handle.next(control.id());
+                if let Some(&token) = update.tokens.first() {
+                    return token;
+                }
+                assert!(
+                    update.terminal.is_none(),
+                    "TP host snapshot request ended before its first token"
+                );
+            }
+        };
+
+        let cold = run(&mut handle, tokens_for(0));
+        let _ = run(&mut handle, tokens_for(1));
+        let _ = run(&mut handle, tokens_for(2));
+        let host = run(&mut handle, tokens_for(0));
+        assert_eq!(host, cold, "TP host hit changed the sampled token");
+        let counters = handle
+            .metrics()
+            .prefix_cache
+            .expect("prefix-cache counters");
+        assert!(
+            counters.host_hits > 0,
+            "expected TP host hits: {counters:?}"
+        );
+        drop(handle);
     }
 
     #[test]
