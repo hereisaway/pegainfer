@@ -53,6 +53,26 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) inserts: u64,
     /// Published snapshots replaced by LRU insertion.
     pub(crate) evictions: u64,
+    /// Prompt tokens looked up in the joint prefix cache.
+    pub(crate) queries: u64,
+    /// Of `joint_hit_tokens`, tokens restored from the pinned host tier.
+    pub(crate) host_hits: u64,
+    /// GPU -> host spills.
+    pub(crate) spills: u64,
+    /// Host entries evicted to make room for a spill.
+    pub(crate) host_evictions: u64,
+    /// Insertions skipped because every slot was pinned or no host slot was free.
+    pub(crate) skips: u64,
+}
+
+/// Counters that live in the snapshot store rather than the prefix-cache facade.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SnapshotStats {
+    pub(crate) spills: u64,
+    pub(crate) host_evictions: u64,
+    pub(crate) skips: u64,
+    pub(crate) gpu_occupancy: usize,
+    pub(crate) host_occupancy: usize,
 }
 
 /// Which backing tier holds one published snapshot.
@@ -109,6 +129,9 @@ struct SnapshotCache {
     gpu_slot_count: usize,
     /// Monotonic logical time for LRU ordering.
     clock: u64,
+    spills: u64,
+    host_evictions: u64,
+    skips: u64,
 }
 
 impl SnapshotCache {
@@ -119,6 +142,9 @@ impl SnapshotCache {
             free_host_slots: (0..host_slot_count).rev().collect(),
             gpu_slot_count,
             clock: 0,
+            spills: 0,
+            host_evictions: 0,
+            skips: 0,
         }
     }
 
@@ -175,6 +201,25 @@ impl SnapshotCache {
 
     fn release_host_slot(&mut self, slot: usize) {
         self.free_host_slots.push(slot);
+    }
+
+    fn record_spill(&mut self) {
+        self.spills += 1;
+    }
+
+    fn record_host_eviction(&mut self) {
+        self.host_evictions += 1;
+    }
+
+    fn record_skip(&mut self) {
+        self.skips += 1;
+    }
+
+    fn occupancy(&self, tier: SnapshotTier) -> usize {
+        self.entries
+            .values()
+            .filter(|entry| entry.tier == tier)
+            .count()
     }
 
     /// Remove the oldest unpinned entry of `tier`, returning its key and slot.
@@ -438,6 +483,16 @@ impl RecurrentSnapshotStore {
         self.cache.len()
     }
 
+    pub(crate) fn stats(&self) -> SnapshotStats {
+        SnapshotStats {
+            spills: self.cache.spills,
+            host_evictions: self.cache.host_evictions,
+            skips: self.cache.skips,
+            gpu_occupancy: self.cache.occupancy(SnapshotTier::Gpu),
+            host_occupancy: self.cache.occupancy(SnapshotTier::Host),
+        }
+    }
+
     pub(crate) fn contains(&self, key: PrefixBoundaryKey) -> bool {
         self.cache.contains(key)
     }
@@ -465,6 +520,7 @@ impl RecurrentSnapshotStore {
         }
         let Some((victim_key, victim_slot)) = self.cache.take_unpinned_victim(SnapshotTier::Gpu)
         else {
+            self.cache.record_skip();
             return Ok(None);
         };
 
@@ -478,8 +534,10 @@ impl RecurrentSnapshotStore {
         let host_slot = if let Some(slot) = self.cache.take_free_host_slot() {
             slot
         } else if let Some((_, slot)) = self.cache.take_unpinned_victim(SnapshotTier::Host) {
+            self.cache.record_host_eviction();
             slot
         } else {
+            self.cache.record_skip();
             self.cache
                 .insert(victim_key, victim_slot, SnapshotTier::Gpu);
             return Ok(None);
@@ -502,6 +560,7 @@ impl RecurrentSnapshotStore {
                 .insert(victim_key, victim_slot, SnapshotTier::Gpu);
             return Err(error);
         }
+        self.cache.record_spill();
         self.cache.insert(victim_key, host_slot, SnapshotTier::Host);
         Ok(Some(SnapshotReservation {
             k: key,
@@ -620,7 +679,12 @@ impl Qwen35PrefixCache {
 
     /// Return a point-in-time copy of cumulative cache metrics.
     pub(crate) fn stats(&self) -> PrefixCacheStats {
-        self.stats
+        let mut stats = self.stats;
+        let store = self.snapshots.stats();
+        stats.spills = store.spills;
+        stats.host_evictions = store.host_evictions;
+        stats.skips = store.skips;
+        stats
     }
 
     /// Return the longest prefix with both active KV and a recurrent snapshot.
@@ -676,6 +740,7 @@ impl Qwen35PrefixCache {
         if !self.enabled() || !allow_match {
             return Ok((request, None));
         }
+        self.stats.queries += prompt_tokens.len() as u64;
 
         let probe = self
             .kv
@@ -747,8 +812,12 @@ impl Qwen35PrefixCache {
             request.kv_position(),
             boundary,
         );
+        let tier = guard.tier();
         self.stats.joint_hits += 1;
         self.stats.joint_hit_tokens += boundary as u64;
+        if tier == SnapshotTier::Host {
+            self.stats.host_hits += boundary as u64;
+        }
         // End the cache pin after restore enqueue and position validation.
         drop(guard);
         Ok(boundary)

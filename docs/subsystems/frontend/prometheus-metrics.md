@@ -29,12 +29,17 @@ Qwen3 fills `SchedulerMetrics::prefix_cache` with token-granular totals, counted
 - A connector miss, a query error and a released lease still count their query (`external_queries` advances while `external_hits` stays flat); only a request whose connector was never consulted adds nothing to the external family. Cancellation settles the same way, so a lookup is neither lost nor counted twice.
 - Connector hits are exported as `source="external_unspecified"`, never `host`. A connector query returns a block count only — the blocks can come from host memory, a P2P peer or SSD, and nothing says which — so labeling them `host` would misattribute the peer and disk restores. Carrying the real tier through needs it reported by the offload layer first.
 
+Qwen3.5 fills the same family from its joint KV/recurrent/conv snapshot cache.
+Its internal pinned-host tier has no separate connector query, so host-restored
+tokens are reported in `host_hits` while `host_queries` stays zero; spill and
+host-eviction counters are not exported yet.
+
 ## What deliberately reads zero (state at capture time)
 
-- `prefix_cache_queries/hits` and the external family for every in-tree model line except Qwen3 (the others leave `SchedulerMetrics::prefix_cache` at `None`; an out-of-tree `Scheduler` can fill it), and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
+- `prefix_cache_queries/hits` and the external family for every in-tree model line except Qwen3 and Qwen3.5 (the others leave `SchedulerMetrics::prefix_cache` at `None`; an out-of-tree `Scheduler` can fill it), and the by-reason waiting split (`reason="deferred"` is driven by a skipped-request counter we don't report; all waiting shows as `reason="capacity"`).
 - Per-GPU FLOPs/bytes estimates, KV-block residency histograms, cudagraph stats — the bridge sends `SchedulerStats::default()` for these fields.
 - Every legacy model crate whose scheduler doesn't publish a `LoadSnapshot` watch (currently deepseek and kimi) gets path 1 only; its engine gauges are absent, not lying-zero — the bridge skips the stats task for that partition when no watch exists.
 
 ## Next step
 
-Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, and have the remaining in-tree engines with a prefix cache (Gemma 4's `PEGAINFER_PREFIX_CACHE`, Qwen3.5, GLM5.2) fill `SchedulerMetrics::prefix_cache`, and have the offload layer report which tier answered so Qwen3 can use `host`, `p2p` and `disk` instead of `external_unspecified`. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.
+Next, wire the DeepSeek-V2-Lite and Kimi-K2 schedulers using the same recipe, have the remaining in-tree engines with a prefix cache (Gemma 4's `PEGAINFER_PREFIX_CACHE`, GLM5.2) fill `SchedulerMetrics::prefix_cache`, and have the offload layer report which tier answered so Qwen3 can use `host`, `p2p` and `disk` instead of `external_unspecified`. A future partitioned model must expose its logical scheduler partitions instead of averaging them behind engine 0.

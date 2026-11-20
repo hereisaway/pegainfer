@@ -20,6 +20,7 @@ use std::thread::{self};
 use std::time::Instant;
 
 use anyhow::Result;
+use pegainfer_frontend::engine::PrefixCacheCounters;
 use pegainfer_frontend::sampler::SamplingParams;
 use pegainfer_kv_cache::KvCacheManager;
 use pegainfer_kv_cache::KvView;
@@ -592,10 +593,24 @@ impl Qwen35TpExecutor {
         self.kv_cache.enabled()
     }
 
+    pub(crate) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        if !self.kv_cache.enabled() {
+            return None;
+        }
+        let stats = self.kv_cache.stats();
+        Some(PrefixCacheCounters {
+            queries: stats.queries,
+            hits: stats.joint_hit_tokens,
+            host_queries: 0,
+            host_hits: stats.host_hits,
+            external_unspecified_hits: 0,
+        })
+    }
+
     pub(crate) fn log_prefix_cache_stats(&self) {
         let stats = self.kv_cache.stats();
         log::info!(
-            "prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            "prefix cache summary: ranks={}, joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, queries={}, host_hits={}, spills={}, host_evictions={}, skips={}, occupancy={}/{}",
             self.world_size,
             stats.joint_hits,
             stats.joint_hit_tokens,
@@ -603,6 +618,11 @@ impl Qwen35TpExecutor {
             stats.snapshot_misses,
             stats.inserts,
             stats.evictions,
+            stats.queries,
+            stats.host_hits,
+            stats.spills,
+            stats.host_evictions,
+            stats.skips,
             self.kv_cache.snapshot_occupancy(),
             self.kv_cache.snapshot_slots(),
         );

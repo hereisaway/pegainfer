@@ -27,6 +27,11 @@ struct Qwen35Cli {
     /// Per-rank GPU budget in MiB for joint prefix snapshots; zero disables reuse.
     #[arg(long, default_value_t = 0)]
     qwen35_prefix_cache_mib: usize,
+    /// Per-rank pinned-host budget in MiB for spilled snapshot state; zero keeps
+    /// the host tier off. Requires a positive --qwen35-prefix-cache-mib and is
+    /// single-GPU only for now.
+    #[arg(long, default_value_t = 0)]
+    qwen35_snapshot_host_mib: usize,
     /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
     /// the next graph bucket but admits only this many scheduler slots; defaults
     /// to 64.
@@ -75,6 +80,7 @@ pub(crate) fn launch_options(ctx: &LaunchContext<'_>) -> Qwen35LaunchOptions {
         cuda_graph: ctx.shared.cuda_graph,
         gdn_backend: cli.qwen35_gdn_backend,
         prefix_cache_mib: cli.qwen35_prefix_cache_mib,
+        snapshot_host_mib: cli.qwen35_snapshot_host_mib,
         max_batch: cli.max_batch.unwrap_or(crate::MAX_DECODE_BATCH),
         max_prefill_tokens: ctx
             .shared
@@ -133,6 +139,21 @@ impl ModelLine for Qwen35Line {
         if cli.qwen35_prefix_cache_mib > 0 && ctx.shared.no_prefix_cache {
             return Err(CliError::rule(
                 "--qwen35-prefix-cache-mib and --no-prefix-cache are contradictory",
+            ));
+        }
+        if cli.qwen35_snapshot_host_mib > 0 && ctx.shared.no_prefix_cache {
+            return Err(CliError::rule(
+                "--qwen35-snapshot-host-mib and --no-prefix-cache are contradictory",
+            ));
+        }
+        if cli.qwen35_snapshot_host_mib > 0 && cli.qwen35_prefix_cache_mib == 0 {
+            return Err(CliError::rule(
+                "--qwen35-snapshot-host-mib requires --qwen35-prefix-cache-mib > 0",
+            ));
+        }
+        if cli.qwen35_snapshot_host_mib > 0 && ctx.shared.tp_size > 1 {
+            return Err(CliError::rule(
+                "Qwen3.5 --qwen35-snapshot-host-mib is single-GPU only for now",
             ));
         }
         crate::check_launch(
@@ -199,6 +220,68 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("contradictory"), "{error}");
+    }
+
+    #[test]
+    fn rejects_snapshot_host_without_gpu_prefix_cache() {
+        let error = validate_argv(&["pegainfer", "--qwen35-snapshot-host-mib", "1024"])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("requires --qwen35-prefix-cache-mib"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn rejects_snapshot_host_on_tp() {
+        let error = validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--qwen35-snapshot-host-mib",
+            "1024",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+        ])
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("single-GPU only"), "{error}");
+    }
+
+    #[test]
+    fn accepts_snapshot_host_with_gpu_prefix_cache() {
+        validate_argv(&[
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--qwen35-snapshot-host-mib",
+            "1024",
+        ])
+        .expect("Qwen3.5 should accept the host tier with a GPU prefix cache");
+    }
+
+    #[test]
+    fn launch_options_carry_snapshot_host_budget() {
+        let argv = [
+            "pegainfer",
+            "--qwen35-prefix-cache-mib",
+            "128",
+            "--qwen35-snapshot-host-mib",
+            "1024",
+        ];
+        let (shared, matches, _provided) = parse_for_line(&MODEL_LINE, &argv).unwrap();
+        let config = serde_json::json!({});
+        let ctx = LaunchContext {
+            model_path: std::path::Path::new("unused"),
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        let options = super::launch_options(&ctx);
+        assert_eq!(options.prefix_cache_mib, 128);
+        assert_eq!(options.snapshot_host_mib, 1024);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Qwen3.5 scheduler backend abstraction (single-GPU + TP).
 
+use pegainfer_frontend::engine::PrefixCacheCounters;
+
 use super::*;
 use crate::logprobs::LogprobSnapshot;
 use crate::tp_executor::TpBeginRequestError;
@@ -114,6 +116,23 @@ impl From<TpBeginRequestError> for AdmissionError {
     }
 }
 
+fn host_snapshot_slots(
+    host_snapshot_bytes: usize,
+    snapshot_bytes_per_slot: usize,
+) -> Result<usize> {
+    if host_snapshot_bytes == 0 {
+        return Ok(0);
+    }
+    let slots = host_snapshot_bytes / snapshot_bytes_per_slot;
+    anyhow::ensure!(
+        slots > 0,
+        "Qwen3.5 snapshot-host budget is {} MiB, but one snapshot requires {:.3} MiB",
+        host_snapshot_bytes / (1024 * 1024),
+        snapshot_bytes_per_slot as f64 / 1024.0 / 1024.0,
+    );
+    Ok(slots)
+}
+
 impl SingleGpuBackend {
     fn schedule_prefill_views(
         &self,
@@ -205,17 +224,36 @@ impl SingleGpuBackend {
         Ok(())
     }
 
+    pub(super) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        if !self.kv_cache.enabled() {
+            return None;
+        }
+        let stats = self.kv_cache.stats();
+        Some(PrefixCacheCounters {
+            queries: stats.queries,
+            hits: stats.joint_hit_tokens,
+            host_queries: 0,
+            host_hits: stats.host_hits,
+            external_unspecified_hits: 0,
+        })
+    }
+
     pub(super) fn log_prefix_cache_stats(&self) {
         let cache = &self.kv_cache;
         let stats = cache.stats();
         info!(
-            "prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, occupancy={}/{}",
+            "prefix cache summary: joint_hits={}, hit_tokens={}, kv_only_fallbacks={}, snapshot_misses={}, inserts={}, evictions={}, queries={}, host_hits={}, spills={}, host_evictions={}, skips={}, occupancy={}/{}",
             stats.joint_hits,
             stats.joint_hit_tokens,
             stats.kv_only_fallbacks,
             stats.snapshot_misses,
             stats.inserts,
             stats.evictions,
+            stats.queries,
+            stats.host_hits,
+            stats.spills,
+            stats.host_evictions,
+            stats.skips,
             cache.snapshot_occupancy(),
             cache.snapshot_slots(),
         );
@@ -225,16 +263,31 @@ impl SingleGpuBackend {
         model: Qwen35Model,
         max_batch: usize,
         decode_overlap: Qwen35DecodeOverlap,
+        host_snapshot_bytes: usize,
     ) -> Result<Self> {
         anyhow::ensure!(max_batch > 0, "Qwen3.5 max_batch must be > 0");
         let manager =
             KvCacheManager::from_buffer(model.kv_buffer().clone(), model.kv_buffer().num_blocks())?;
+        let snapshot_bytes_per_slot =
+            crate::recurrent_state::bytes_per_request(model.config(), model.geometry);
+        let host_slots = host_snapshot_slots(host_snapshot_bytes, snapshot_bytes_per_slot)?;
+        anyhow::ensure!(
+            host_snapshot_bytes == 0 || model.prefix_snapshot_slots() > 0,
+            "Qwen3.5 snapshot-host tier requires a positive GPU prefix-cache budget"
+        );
+        if host_slots > 0 {
+            info!(
+                "Qwen3.5 snapshot host tier: {} slots ({} MiB) per rank",
+                host_slots,
+                host_snapshot_bytes / (1024 * 1024)
+            );
+        }
         let snapshots = RecurrentSnapshotStore::new_gpu(
             model.device_ctx(),
             model.config(),
             model.geometry,
             model.prefix_snapshot_slots(),
-            0,
+            host_slots,
         )?;
         let kv_cache = Qwen35PrefixCache::new_with_store(manager, snapshots)?;
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
@@ -775,7 +828,20 @@ impl TpSchedulerBackend {
     }
 }
 
+impl TpSchedulerBackend {
+    pub(super) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        self.executor.prefix_cache_counters()
+    }
+}
+
 impl SchedulerBackend {
+    pub(super) fn prefix_cache_counters(&self) -> Option<PrefixCacheCounters> {
+        match self {
+            Self::Single(backend) => backend.prefix_cache_counters(),
+            Self::Tp(backend) => backend.prefix_cache_counters(),
+        }
+    }
+
     pub(super) fn log_prefix_cache_stats(&self) {
         match self {
             Self::Single(backend) if backend.kv_cache.enabled() => backend.log_prefix_cache_stats(),
@@ -855,5 +921,19 @@ impl SchedulerBackend {
             Self::Single(backend) => backend.is_stop_token(token),
             Self::Tp(backend) => backend.is_stop_token(token),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_snapshot_slots;
+
+    #[test]
+    fn host_snapshot_slots_rounds_down_and_rejects_empty() {
+        let slot = 49 * 1024 * 1024 + 128 * 1024;
+        assert_eq!(host_snapshot_slots(0, slot).unwrap(), 0);
+        assert_eq!(host_snapshot_slots(slot, slot).unwrap(), 1);
+        assert_eq!(host_snapshot_slots(slot * 2 + slot / 2, slot).unwrap(), 2);
+        assert!(host_snapshot_slots(slot - 1, slot).is_err());
     }
 }
