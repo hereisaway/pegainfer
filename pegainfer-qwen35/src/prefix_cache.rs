@@ -6,6 +6,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use anyhow::Result;
+use cudarc::driver::PinnedHostSlice;
 use pegainfer_core::tensor::DeviceContext;
 use pegainfer_kv_cache::KvBuffer;
 use pegainfer_kv_cache::KvCacheManager;
@@ -54,10 +55,18 @@ pub(crate) struct PrefixCacheStats {
     pub(crate) evictions: u64,
 }
 
+/// Which backing tier holds one published snapshot.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SnapshotTier {
+    Gpu,
+    Host,
+}
+
 /// One recurrent snapshot indexed by a reusable prefix boundary.
 struct SnapshotEntry {
-    /// Identically numbered physical recurrent snapshot on every rank.
-    recurrent_slot: usize,
+    /// Physical slot in the GPU store (`Gpu`) or the pinned host slab (`Host`).
+    slot: usize,
+    tier: SnapshotTier,
     /// Logical timestamp used to select an unpinned LRU victim.
     last_used: AtomicU64,
 }
@@ -75,41 +84,52 @@ impl SnapshotGuard {
         self.boundary
     }
 
+    /// Slot number in the GPU store or the host slab, depending on [`Self::tier`].
     pub(crate) fn recurrent_slot(&self) -> usize {
-        self.entry.recurrent_slot
+        self.entry.slot
+    }
+
+    pub(crate) fn tier(&self) -> SnapshotTier {
+        self.entry.tier
     }
 }
 
-/// Mutable prefix-cache state shared by every execution rank.
+/// Mutable prefix-cache directory shared by every execution rank.
+///
+/// This owns no device memory; the physical GPU slots and the pinned host slab
+/// live in [`RecurrentSnapshotStore`].
 struct SnapshotCache {
     /// Published boundary key to its recurrent snapshot entry.
     entries: HashMap<PrefixBoundaryKey, Arc<SnapshotEntry>>,
-    /// Unpublished slots available without eviction.
-    free_slots: Vec<usize>,
-    /// Total number of preallocated physical snapshot slots.
-    slot_count: usize,
+    /// GPU slots never published or returned by an abort.
+    free_gpu_slots: Vec<usize>,
+    /// Host slots never published or returned by a host eviction.
+    free_host_slots: Vec<usize>,
+    /// Number of preallocated GPU snapshot slots (the legacy capacity metric).
+    gpu_slot_count: usize,
     /// Monotonic logical time for LRU ordering.
     clock: u64,
 }
 
 impl SnapshotCache {
-    fn new(slot_count: usize) -> Self {
+    fn new(gpu_slot_count: usize, host_slot_count: usize) -> Self {
         Self {
-            entries: HashMap::with_capacity(slot_count),
-            free_slots: (0..slot_count).rev().collect(),
-            slot_count,
+            entries: HashMap::with_capacity(gpu_slot_count + host_slot_count),
+            free_gpu_slots: (0..gpu_slot_count).rev().collect(),
+            free_host_slots: (0..host_slot_count).rev().collect(),
+            gpu_slot_count,
             clock: 0,
         }
     }
 
-    /// Number of currently published joint entries.
+    /// Number of currently published joint entries, GPU and host.
     fn len(&self) -> usize {
         self.entries.len()
     }
 
-    /// Number of preallocated recurrent-state slots.
+    /// Number of preallocated GPU snapshot slots.
     fn capacity(&self) -> usize {
-        self.slot_count
+        self.gpu_slot_count
     }
 
     /// Advance the non-zero logical clock used by the LRU policy.
@@ -133,74 +153,185 @@ impl SnapshotCache {
         self.entries.contains_key(&key)
     }
 
-    /// Reserve a free or unpinned LRU slot without publishing the new entry.
-    fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservation> {
+    /// Refresh a duplicate key without reserving another snapshot.
+    fn touch(&mut self, key: PrefixBoundaryKey) {
         let last_used = self.tick();
         if let Some(entry) = self.entries.get(&key) {
             entry.last_used.store(last_used, Ordering::Relaxed);
-            return None;
         }
-
-        let (slot, evicted) = if let Some(slot) = self.free_slots.pop() {
-            (slot, false)
-        } else {
-            let (&victim_key, slot) = self
-                .entries
-                .iter()
-                .filter(|(_, entry)| Arc::strong_count(entry) == 1)
-                .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
-                .map(|(key, entry)| (key, entry.recurrent_slot))?;
-            let evicted = self
-                .entries
-                .remove(&victim_key)
-                .expect("LRU victim must still be present");
-            debug_assert_eq!(evicted.recurrent_slot, slot);
-            (slot, true)
-        };
-
-        Some(SnapshotReservation {
-            recurrent_slot: slot,
-            key,
-            replaced: evicted,
-        })
     }
 
-    /// Publish after every rank has enqueued its recurrent-state copy.
-    fn publish(&mut self, reservation: SnapshotReservation) {
+    fn take_free_gpu_slot(&mut self) -> Option<usize> {
+        self.free_gpu_slots.pop()
+    }
+
+    fn release_gpu_slot(&mut self, slot: usize) {
+        self.free_gpu_slots.push(slot);
+    }
+
+    fn take_free_host_slot(&mut self) -> Option<usize> {
+        self.free_host_slots.pop()
+    }
+
+    fn release_host_slot(&mut self, slot: usize) {
+        self.free_host_slots.push(slot);
+    }
+
+    /// Remove the oldest unpinned entry of `tier`, returning its key and slot.
+    fn take_unpinned_victim(&mut self, tier: SnapshotTier) -> Option<(PrefixBoundaryKey, usize)> {
+        let (&victim_key, slot) = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tier == tier && Arc::strong_count(entry) == 1)
+            .min_by_key(|(_, entry)| entry.last_used.load(Ordering::Relaxed))
+            .map(|(key, entry)| (key, entry.slot))?;
+        let victim = self
+            .entries
+            .remove(&victim_key)
+            .expect("LRU victim must still be present");
+        debug_assert_eq!(victim.slot, slot);
+        debug_assert_eq!(victim.tier, tier);
+        Some((victim_key, slot))
+    }
+
+    /// Publish a new GPU-resident entry after its copy succeeded.
+    fn insert(&mut self, key: PrefixBoundaryKey, slot: usize, tier: SnapshotTier) {
         let last_used = self.tick();
         let previous = self.entries.insert(
-            reservation.key,
+            key,
             Arc::new(SnapshotEntry {
-                recurrent_slot: reservation.recurrent_slot,
+                slot,
+                tier,
                 last_used: AtomicU64::new(last_used),
             }),
         );
         debug_assert!(previous.is_none());
-    }
-
-    /// Return an unpublished slot after a physical copy failure.
-    fn abort(&mut self, reservation: SnapshotReservation) {
-        debug_assert!(!self.entries.contains_key(&reservation.key));
-        self.free_slots.push(reservation.recurrent_slot);
     }
 }
 
 /// One pending central-directory insertion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SnapshotReservation {
-    recurrent_slot: usize,
-    key: PrefixBoundaryKey,
-    /// Whether this insertion replaced an unpinned snapshot entry.
-    replaced: bool,
+    k: PrefixBoundaryKey,
+    slot: usize,
+    /// Set when an unpinned GPU entry was dropped instead of spilled.
+    replaced: Option<SnapshotTier>,
 }
 
 impl SnapshotReservation {
     pub(crate) fn recurrent_slot(self) -> usize {
-        self.recurrent_slot
+        self.slot
     }
 
     fn was_replacement(self) -> bool {
-        self.replaced
+        self.replaced.is_some()
+    }
+}
+
+/// Pinned-host backing for recurrent/conv snapshots.
+struct HostSnapshotSlab {
+    state: PinnedHostSlice<f32>,
+    conv: PinnedHostSlice<half::bf16>,
+    slots: usize,
+    layers: usize,
+    state_per_layer: usize,
+    conv_per_layer: usize,
+    state_per_slot: usize,
+    conv_per_slot: usize,
+}
+
+impl HostSnapshotSlab {
+    fn new(
+        ctx: &DeviceContext,
+        config: &Config35,
+        geometry: LocalGeometry,
+        slots: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(slots > 0, "host snapshot slab needs at least one slot");
+        let layers = config.num_hidden_layers - config.num_full_attention_layers();
+        let state_per_layer = geometry.local_linear_num_value_heads()
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_per_layer = geometry.local_linear_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+        let state_per_slot = layers * state_per_layer;
+        let conv_per_slot = layers * conv_per_layer;
+        let state = unsafe { ctx.ctx.alloc_pinned::<f32>(slots * state_per_slot) }
+            .map_err(|e| anyhow::anyhow!("allocate pinned recurrent slab: {e}"))?;
+        let conv = unsafe { ctx.ctx.alloc_pinned::<half::bf16>(slots * conv_per_slot) }
+            .map_err(|e| anyhow::anyhow!("allocate pinned conv slab: {e}"))?;
+        Ok(Self {
+            state,
+            conv,
+            slots,
+            layers,
+            state_per_layer,
+            conv_per_layer,
+            state_per_slot,
+            conv_per_slot,
+        })
+    }
+
+    fn spill_from(&mut self, ctx: &DeviceContext, src: &RecurrentState, slot: usize) -> Result<()> {
+        anyhow::ensure!(slot < self.slots, "host snapshot slot {slot} out of range");
+        anyhow::ensure!(
+            src.layers.len() == self.layers,
+            "host snapshot layer mismatch: src={}, expected={}",
+            src.layers.len(),
+            self.layers
+        );
+        let state = self.state.as_mut_slice()?;
+        let conv = self.conv.as_mut_slice()?;
+        let state_base = slot * self.state_per_slot;
+        let conv_base = slot * self.conv_per_slot;
+        for layer in 0..self.layers {
+            let state_at = state_base + layer * self.state_per_layer;
+            ctx.stream.memcpy_dtoh(
+                &src.layers[layer].state,
+                &mut state[state_at..state_at + self.state_per_layer],
+            )?;
+            let conv_at = conv_base + layer * self.conv_per_layer;
+            ctx.stream.memcpy_dtoh(
+                &src.layers[layer].conv_state.data,
+                &mut conv[conv_at..conv_at + self.conv_per_layer],
+            )?;
+        }
+        ctx.stream.synchronize()?;
+        Ok(())
+    }
+
+    fn restore_into(
+        &self,
+        ctx: &DeviceContext,
+        slot: usize,
+        dst: &mut RecurrentState,
+    ) -> Result<()> {
+        anyhow::ensure!(slot < self.slots, "host snapshot slot {slot} out of range");
+        anyhow::ensure!(
+            dst.layers.len() == self.layers,
+            "host snapshot layer mismatch: dst={}, expected={}",
+            dst.layers.len(),
+            self.layers
+        );
+        let state = self.state.as_slice()?;
+        let conv = self.conv.as_slice()?;
+        let state_base = slot * self.state_per_slot;
+        let conv_base = slot * self.conv_per_slot;
+        for layer in 0..self.layers {
+            let state_at = state_base + layer * self.state_per_layer;
+            ctx.stream.memcpy_htod(
+                &state[state_at..state_at + self.state_per_layer],
+                &mut dst.layers[layer].state,
+            )?;
+            let conv_at = conv_base + layer * self.conv_per_layer;
+            ctx.stream.memcpy_htod(
+                &conv[conv_at..conv_at + self.conv_per_layer],
+                &mut dst.layers[layer].conv_state.data,
+            )?;
+        }
+        // v1 restores synchronously on the admission thread. The explicit sync
+        // also keeps the pinned source alive until the H2D copy has completed.
+        ctx.stream.synchronize()?;
+        Ok(())
     }
 }
 
@@ -250,34 +381,52 @@ impl RecurrentStateStore {
     }
 }
 
-/// Owns the recurrent/conv snapshot directory and, on a single-GPU backend,
-/// the physical GPU slots. The TP controller builds a directory-only store;
-/// each TP worker keeps its own `RecurrentStateStore`.
+/// Owns the recurrent/conv snapshot directory plus the physical GPU slots and,
+/// when configured, the pinned host backing slab. The TP controller builds a
+/// directory-only store; each TP worker keeps its own `RecurrentStateStore`.
 pub(crate) struct RecurrentSnapshotStore {
     cache: SnapshotCache,
     slots: Option<RecurrentStateStore>,
+    host: Option<HostSnapshotSlab>,
+    ctx: Option<DeviceContext>,
 }
 
 impl RecurrentSnapshotStore {
     /// Directory only: no physical slots (TP controller, zero-budget builds).
-    pub(crate) fn new_directory(slot_count: usize) -> Self {
+    pub(crate) fn new_directory(gpu_slot_count: usize) -> Self {
         Self {
-            cache: SnapshotCache::new(slot_count),
+            cache: SnapshotCache::new(gpu_slot_count, 0),
             slots: None,
+            host: None,
+            ctx: None,
         }
     }
 
-    /// Directory plus GPU-resident physical slots (single-GPU backend).
+    /// Directory plus GPU-resident physical slots and an optional pinned host
+    /// slab. `host_slot_count == 0` is exactly the step-1 behavior.
     pub(crate) fn new_gpu(
         ctx: &DeviceContext,
         config: &Config35,
         geometry: LocalGeometry,
-        slot_count: usize,
+        gpu_slot_count: usize,
+        host_slot_count: usize,
     ) -> Result<Self> {
-        let slots = RecurrentStateStore::new(ctx, config, geometry, slot_count)?;
+        let slots = RecurrentStateStore::new(ctx, config, geometry, gpu_slot_count)?;
+        let host = if host_slot_count == 0 {
+            None
+        } else {
+            Some(HostSnapshotSlab::new(
+                ctx,
+                config,
+                geometry,
+                host_slot_count,
+            )?)
+        };
         Ok(Self {
-            cache: SnapshotCache::new(slot_count),
+            cache: SnapshotCache::new(gpu_slot_count, host_slot_count),
             slots: Some(slots),
+            host,
+            ctx: Some(ctx.clone()),
         })
     }
 
@@ -297,16 +446,78 @@ impl RecurrentSnapshotStore {
         self.cache.lookup(key)
     }
 
-    pub(crate) fn reserve(&mut self, key: PrefixBoundaryKey) -> Option<SnapshotReservation> {
-        self.cache.reserve(key)
+    /// Reserve a free or reused GPU slot. With a host slab, the GPU victim is
+    /// spilled to pinned host before its slot is reused.
+    pub(crate) fn reserve(
+        &mut self,
+        key: PrefixBoundaryKey,
+    ) -> Result<Option<SnapshotReservation>> {
+        if self.cache.contains(key) {
+            self.cache.touch(key);
+            return Ok(None);
+        }
+        if let Some(slot) = self.cache.take_free_gpu_slot() {
+            return Ok(Some(SnapshotReservation {
+                k: key,
+                slot,
+                replaced: None,
+            }));
+        }
+        let Some((victim_key, victim_slot)) = self.cache.take_unpinned_victim(SnapshotTier::Gpu)
+        else {
+            return Ok(None);
+        };
+
+        let Some(host) = self.host.as_mut() else {
+            return Ok(Some(SnapshotReservation {
+                k: key,
+                slot: victim_slot,
+                replaced: Some(SnapshotTier::Gpu),
+            }));
+        };
+        let host_slot = if let Some(slot) = self.cache.take_free_host_slot() {
+            slot
+        } else if let Some((_, slot)) = self.cache.take_unpinned_victim(SnapshotTier::Host) {
+            slot
+        } else {
+            self.cache
+                .insert(victim_key, victim_slot, SnapshotTier::Gpu);
+            return Ok(None);
+        };
+        let ctx = self
+            .ctx
+            .as_ref()
+            .expect("host snapshot store requires a device context");
+        let slots = self
+            .slots
+            .as_ref()
+            .expect("host snapshot store requires GPU slots");
+        let src = slots
+            .slots
+            .get(victim_slot)
+            .ok_or_else(|| anyhow::anyhow!("snapshot slot {victim_slot} out of range"))?;
+        if let Err(error) = host.spill_from(ctx, src, host_slot) {
+            self.cache.release_host_slot(host_slot);
+            self.cache
+                .insert(victim_key, victim_slot, SnapshotTier::Gpu);
+            return Err(error);
+        }
+        self.cache.insert(victim_key, host_slot, SnapshotTier::Host);
+        Ok(Some(SnapshotReservation {
+            k: key,
+            slot: victim_slot,
+            replaced: None,
+        }))
     }
 
     pub(crate) fn publish(&mut self, reservation: SnapshotReservation) {
-        self.cache.publish(reservation);
+        self.cache
+            .insert(reservation.k, reservation.slot, SnapshotTier::Gpu);
     }
 
     pub(crate) fn abort(&mut self, reservation: SnapshotReservation) {
-        self.cache.abort(reservation);
+        debug_assert!(!self.cache.contains(reservation.k));
+        self.cache.release_gpu_slot(reservation.slot);
     }
 
     pub(crate) fn save(
@@ -328,11 +539,23 @@ impl RecurrentSnapshotStore {
         guard: &SnapshotGuard,
         dst: &mut RecurrentState,
     ) -> Result<()> {
-        let slots = self
-            .slots
-            .as_ref()
-            .expect("snapshot store has no GPU slots; directory-only stores cannot restore");
-        slots.restore(ctx, guard.recurrent_slot(), dst)
+        match guard.tier() {
+            SnapshotTier::Gpu => {
+                let slots = self.slots.as_ref().expect(
+                    "snapshot store has no GPU slots; directory-only stores cannot restore",
+                );
+                slots.restore(ctx, guard.recurrent_slot(), dst)
+            }
+            SnapshotTier::Host => {
+                let host = self
+                    .host
+                    .as_ref()
+                    .expect("host snapshot entry without a host slab");
+                host.restore_into(ctx, guard.recurrent_slot(), dst)?;
+                dst.seq_len = guard.boundary();
+                Ok(())
+            }
+        }
     }
 }
 
@@ -592,7 +815,7 @@ impl Qwen35PrefixCache {
             sequence_hash,
             boundary_tokens: boundary,
         };
-        Ok(self.snapshots.reserve(key))
+        self.snapshots.reserve(key)
     }
 
     /// Publish after rank-local snapshot copies succeed. `reserve_snapshot`
@@ -705,6 +928,7 @@ mod tests {
     use super::PrefixBoundaryKey;
     use super::RecurrentSnapshotStore;
     use super::RecurrentState;
+    use super::SnapshotTier;
     use super::eligible_boundaries;
 
     fn key(tag: u8) -> PrefixBoundaryKey {
@@ -732,6 +956,7 @@ mod tests {
         let mut state = RecurrentSnapshotStore::new_directory(1);
         let reservation = state
             .reserve(key(1))
+            .expect("reserve failed")
             .expect("empty state must reserve a write");
         assert!(state.lookup(key(1)).is_none());
         state.publish(reservation);
@@ -743,10 +968,11 @@ mod tests {
         let mut state = RecurrentSnapshotStore::new_directory(1);
         let reservation = state
             .reserve(key(1))
+            .expect("reserve failed")
             .expect("empty state must reserve a write");
         state.abort(reservation);
         assert!(state.lookup(key(1)).is_none());
-        assert!(state.reserve(key(2)).is_some());
+        assert!(state.reserve(key(2)).expect("reserve").is_some());
     }
 
     #[test]
@@ -755,12 +981,14 @@ mod tests {
         for tag in [1, 2] {
             let reservation = state
                 .reserve(key(tag))
+                .expect("reserve failed")
                 .expect("state should have a free slot");
             state.publish(reservation);
         }
-        assert!(state.reserve(key(1)).is_none());
+        assert!(state.reserve(key(1)).expect("reserve").is_none());
         let reservation = state
             .reserve(key(3))
+            .expect("reserve failed")
             .expect("an unpinned LRU victim should be available");
         state.publish(reservation);
         assert!(state.lookup(key(1)).is_some());
@@ -774,12 +1002,14 @@ mod tests {
         for tag in [1, 2] {
             let reservation = state
                 .reserve(key(tag))
+                .expect("reserve failed")
                 .expect("state should have a free slot");
             state.publish(reservation);
         }
         drop(state.lookup(key(1)).expect("key 1 should be present"));
         let reservation = state
             .reserve(key(3))
+            .expect("reserve failed")
             .expect("an unpinned LRU victim should be available");
         state.publish(reservation);
         assert!(state.lookup(key(1)).is_some());
@@ -792,12 +1022,13 @@ mod tests {
         let mut state = RecurrentSnapshotStore::new_directory(1);
         let reservation = state
             .reserve(key(1))
+            .expect("reserve failed")
             .expect("empty state must reserve a write");
         state.publish(reservation);
         let guard = state.lookup(key(1)).expect("key 1 should be present");
-        assert!(state.reserve(key(2)).is_none());
+        assert!(state.reserve(key(2)).expect("reserve").is_none());
         drop(guard);
-        assert!(state.reserve(key(2)).is_some());
+        assert!(state.reserve(key(2)).expect("reserve").is_some());
     }
 
     #[test]
@@ -814,7 +1045,7 @@ mod tests {
             LocalGeometry::try_new(&config, Default::default()).expect("derive local geometry");
 
         let mut store =
-            RecurrentSnapshotStore::new_gpu(&ctx, &config, geometry, 1).expect("create store");
+            RecurrentSnapshotStore::new_gpu(&ctx, &config, geometry, 1, 0).expect("create store");
         let mut src = RecurrentState::new(&ctx, &config, geometry).expect("allocate source");
         src.seq_len = 256;
 
@@ -837,7 +1068,10 @@ mod tests {
             sequence_hash: [7; 16],
             boundary_tokens: 256,
         };
-        let reservation = store.reserve(key).expect("empty store must reserve");
+        let reservation = store
+            .reserve(key)
+            .expect("reserve failed")
+            .expect("empty store must reserve");
         store.save(&ctx, reservation, &src).expect("save snapshot");
         store.publish(reservation);
         assert!(store.contains(key));
@@ -858,5 +1092,121 @@ mod tests {
             .expect("read restored conv state");
         assert_eq!(restored_state, host_state);
         assert_eq!(restored_conv, host_conv);
+    }
+
+    fn fill_first_layer(
+        ctx: &DeviceContext,
+        state: &mut RecurrentState,
+        state_len: usize,
+        conv_len: usize,
+        base: f32,
+    ) -> (Vec<f32>, Vec<half::bf16>) {
+        let host_state: Vec<f32> = (0..state_len).map(|i| i as f32 * 0.25 + base).collect();
+        let host_conv: Vec<half::bf16> = (0..conv_len)
+            .map(|i| half::bf16::from_f32(i as f32 * 0.5 - base))
+            .collect();
+        ctx.stream
+            .memcpy_htod(&host_state, &mut state.layers[0].state)
+            .expect("fill recurrent state");
+        ctx.stream
+            .memcpy_htod(&host_conv, &mut state.layers[0].conv_state.data)
+            .expect("fill conv state");
+        (host_state, host_conv)
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device and a Qwen3.5 model directory (PEGAINFER_TEST_MODEL_PATH)"]
+    fn gpu_snapshot_store_spills_to_pinned_host() {
+        let Some(model_path) =
+            crate::test_fixture::model_path_or_skip("gpu_snapshot_store_spills_to_pinned_host")
+        else {
+            return;
+        };
+        let ctx = DeviceContext::new_with_device(0).expect("create CUDA context");
+        let config = Config35::from_file(&model_path).expect("load Qwen3.5 config");
+        let geometry =
+            LocalGeometry::try_new(&config, Default::default()).expect("derive local geometry");
+        let state_len = geometry.local_linear_num_value_heads()
+            * config.linear_key_head_dim
+            * config.linear_value_head_dim;
+        let conv_len = geometry.local_linear_qkv_dim() * (config.linear_conv_kernel_dim - 1);
+
+        let mut store = RecurrentSnapshotStore::new_gpu(&ctx, &config, geometry, 1, 1)
+            .expect("create store with one GPU and one host slot");
+        let mut src_a = RecurrentState::new(&ctx, &config, geometry).expect("allocate A");
+        src_a.seq_len = 256;
+        let expected_a = fill_first_layer(&ctx, &mut src_a, state_len, conv_len, 1.0);
+        let mut src_b = RecurrentState::new(&ctx, &config, geometry).expect("allocate B");
+        src_b.seq_len = 256;
+        let expected_b = fill_first_layer(&ctx, &mut src_b, state_len, conv_len, 7.0);
+
+        let key_a = PrefixBoundaryKey {
+            sequence_hash: [1; 16],
+            boundary_tokens: 256,
+        };
+        let key_b = PrefixBoundaryKey {
+            sequence_hash: [2; 16],
+            boundary_tokens: 256,
+        };
+
+        let reservation_a = store
+            .reserve(key_a)
+            .expect("reserve A")
+            .expect("A gets the free GPU slot");
+        store.save(&ctx, reservation_a, &src_a).expect("save A");
+        store.publish(reservation_a);
+
+        // No guard is held, so reserving B spills A to the pinned host slab and
+        // reuses A's GPU slot.
+        let reservation_b = store
+            .reserve(key_b)
+            .expect("reserve B")
+            .expect("B reuses A's slot after the spill");
+        store.save(&ctx, reservation_b, &src_b).expect("save B");
+        store.publish(reservation_b);
+
+        let guard_a = store.lookup(key_a).expect("A must survive on host");
+        assert_eq!(guard_a.tier(), SnapshotTier::Host);
+        let guard_b = store.lookup(key_b).expect("B must be on GPU");
+        assert_eq!(guard_b.tier(), SnapshotTier::Gpu);
+        assert_eq!(store.len(), 2);
+
+        let mut restored_a =
+            RecurrentState::new(&ctx, &config, geometry).expect("allocate restore A");
+        store
+            .restore_into(&ctx, &guard_a, &mut restored_a)
+            .expect("restore A from host");
+        let mut restored_b =
+            RecurrentState::new(&ctx, &config, geometry).expect("allocate restore B");
+        store
+            .restore_into(&ctx, &guard_b, &mut restored_b)
+            .expect("restore B from GPU");
+
+        assert_eq!(restored_a.seq_len, 256);
+        assert_eq!(restored_b.seq_len, 256);
+        assert_eq!(
+            ctx.stream
+                .clone_dtoh(&restored_a.layers[0].state)
+                .expect("read A state"),
+            expected_a.0
+        );
+        assert_eq!(
+            ctx.stream
+                .clone_dtoh(&restored_a.layers[0].conv_state.data)
+                .expect("read A conv"),
+            expected_a.1
+        );
+        assert_eq!(
+            ctx.stream
+                .clone_dtoh(&restored_b.layers[0].state)
+                .expect("read B state"),
+            expected_b.0
+        );
+        assert_eq!(
+            ctx.stream
+                .clone_dtoh(&restored_b.layers[0].conv_state.data)
+                .expect("read B conv"),
+            expected_b.1
+        );
     }
 }

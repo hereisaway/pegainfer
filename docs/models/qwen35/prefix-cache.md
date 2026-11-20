@@ -144,8 +144,9 @@ slots on the single-GPU backend:
 - **TP:** the controller uses `RecurrentSnapshotStore::new_directory` (metadata
   only), while each worker keeps its own `RecurrentStateStore`. The controller's
   slot decision is broadcast, so every rank uses the same slot number.
-- **Host tier (step 2):** the store will also own the pinned host slab; this
-  first step keeps `host_slots = 0`.
+- **Host tier:** the store can also own a pinned host slab. Serving keeps
+  `host_slots = 0` until the step-3 flag lands; the spill path is exercised by
+  the device tests.
 
 ```rust
 struct Qwen35PrefixCache {
@@ -195,6 +196,25 @@ struct PrefixBoundaryKey {
 `sequence_hash` is the canonical hash returned by the KV cache for the block ending at `boundary_tokens`. It already includes earlier block lineage and adapter salt. Storing `boundary_tokens` explicitly prevents reuse at the wrong token position.
 
 `SnapshotEntry` owns one recurrent-state slot; a `SnapshotGuard` pins it by holding another `Arc`. `BlockPool` owns KV, with `PrefixProbe` and the request-local attachment keeping matched blocks alive through lookup and attach. TP publishes only after every worker saves the same slot at the same boundary, and reports a hit only after every worker confirms the restored boundary.
+
+## Host spill (step 2)
+
+`RecurrentSnapshotStore::new_gpu` can take a host slot budget (serving keeps it
+0 until the step-3 flag lands). When set, it allocates one pinned f32 slab for
+the recurrent state and one pinned bf16 slab for the conv state, with one
+snapshot-sized slot per host entry (49.125 MiB for Qwen3.5-4B).
+
+- `reserve` first uses a free GPU slot. If none, it takes the oldest unpinned
+  GPU entry; with a host slab it copies that state to a free host slot (evicting
+  the oldest unpinned host entry when the host is full) and reuses the GPU slot
+  for the new entry.
+- A host hit copies directly into the request's `RecurrentState`; it needs no
+  free GPU slot and is not promoted back to GPU.
+- A host entry is not actively retired when its KV disappears: the KV probe
+  cannot reach it, and the host LRU eventually drops it.
+- Restore is synchronous in v1 (about 1.1-2.2 ms H2D for one slot).
+- There is no serving flag yet; step 3 wires `--qwen35-snapshot-host-mib`,
+  budgets, metrics and TP slot agreement.
 
 ## Creating a snapshot
 

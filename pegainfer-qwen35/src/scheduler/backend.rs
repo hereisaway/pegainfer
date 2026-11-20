@@ -234,6 +234,7 @@ impl SingleGpuBackend {
             model.config(),
             model.geometry,
             model.prefix_snapshot_slots(),
+            0,
         )?;
         let kv_cache = Qwen35PrefixCache::new_with_store(manager, snapshots)?;
         let graph_capacity = crate::batch_decode_graph::bucket_for(max_batch);
